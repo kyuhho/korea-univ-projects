@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Data and Results
+results/
+*.png
+*.jpg
+*.jpeg
+*.tar.gz
+*.zip
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store

@@ -1,0 +1,561 @@
+import torch
+import torch.nn as nn
+import math
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_channels=3, embed_dim=192):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        # x: (B, C, H, W) -> (B, E, H/P, W/P) -> (B, E, N) -> (B, N, E)
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        return x
+
+# --- Positional Encodings ---
+
+class SinusoidalPE2D(nn.Module):
+    def __init__(self, embed_dim, n_patches, img_size, patch_size):
+        super().__init__()
+        self.n_patches = n_patches
+        # 2D Sinusoidal PE
+        grid_size = img_size // patch_size
+        num_spatial_patches = grid_size * grid_size
+        
+        pe = torch.zeros(num_spatial_patches, embed_dim)
+        
+        # Create a grid of coordinates
+        y_pos, x_pos = torch.meshgrid(torch.arange(grid_size), torch.arange(grid_size), indexing='ij')
+        y_pos = y_pos.flatten().float()
+        x_pos = x_pos.flatten().float()
+
+        # We use half of dimensions for x and half for y
+        d_model_half = embed_dim // 2
+        div_term = torch.exp(torch.arange(0, d_model_half, 2).float() * (-math.log(10000.0) / d_model_half))
+
+        pe[:, 0:d_model_half:2] = torch.sin(x_pos.unsqueeze(1) * div_term)
+        pe[:, 1:d_model_half:2] = torch.cos(x_pos.unsqueeze(1) * div_term)
+        pe[:, d_model_half::2] = torch.sin(y_pos.unsqueeze(1) * div_term)
+        pe[:, d_model_half+1::2] = torch.cos(y_pos.unsqueeze(1) * div_term)
+        
+        # Add CLS token PE (zeros) at the beginning
+        cls_pe = torch.zeros(1, embed_dim)
+        pe = torch.cat([cls_pe, pe], dim=0) # (N+1, E)
+        
+        self.register_buffer('pe', pe.unsqueeze(0)) # (1, N+1, E)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+class LearnablePE(nn.Module):
+    def __init__(self, embed_dim, n_patches):
+        super().__init__()
+        self.pe = nn.Parameter(torch.zeros(1, n_patches, embed_dim))
+        nn.init.trunc_normal_(self.pe, std=0.02)
+
+    def forward(self, x):
+        return x + self.pe
+
+# --- RoPE Implementation ---
+def apply_rotary_pos_emb(x, freqs_cos, freqs_sin):
+    # x: (B, N, H, D)
+    # freqs_cos, freqs_sin: (1, N, 1, D) - broadcastable
+    return (x * freqs_cos) + (rotate_half(x) * freqs_sin)
+
+def rotate_half(x):
+    """Rotates adjacent pairs: [x0, x1, x2, x3, ...] -> [-x1, x0, -x3, x2, ...]"""
+    x1 = x[..., ::2]   # even indices: [x0, x2, x4, ...]
+    x2 = x[..., 1::2]  # odd indices:  [x1, x3, x5, ...]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+class RoPEAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., 
+                 img_size=32, patch_size=4):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Precompute RoPE frequencies
+        grid_size = img_size // patch_size
+        self.head_dim = head_dim
+        
+        # 2D grid coordinates
+        y_pos, x_pos = torch.meshgrid(torch.arange(grid_size), torch.arange(grid_size), indexing='ij')
+        y_pos = y_pos.flatten().float()
+        x_pos = x_pos.flatten().float()
+        
+        # Split head_dim into two halves: first half for X, second half for Y
+        half_dim = head_dim // 2
+        theta_half = 10000.0 ** (-torch.arange(0, half_dim, 2).float() / half_dim)
+        
+        freqs_x = torch.outer(x_pos, theta_half) # (N, half_dim/2)
+        freqs_y = torch.outer(y_pos, theta_half) # (N, half_dim/2)
+        
+        # Expand for rotation pairs and concatenate
+        freqs_x_expanded = freqs_x.repeat_interleave(2, dim=1) # (N, half_dim)
+        freqs_y_expanded = freqs_y.repeat_interleave(2, dim=1) # (N, half_dim)
+        
+        freqs = torch.cat([freqs_x_expanded, freqs_y_expanded], dim=1) # (N, head_dim)
+        
+        self.register_buffer("freqs_cos", freqs.cos().unsqueeze(0).unsqueeze(2)) # (1, N, 1, D)
+        self.register_buffer("freqs_sin", freqs.sin().unsqueeze(0).unsqueeze(2))
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2] # (B, H, N, D)
+
+        # Apply RoPE to Q and K
+        # Transpose to (B, N, H, D) for easier broadcasting
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        
+        # Split CLS and Spatial
+        # Assuming CLS is at index 0
+        q_cls = q_t[:, :1, :, :]
+        q_spatial = q_t[:, 1:, :, :]
+        k_cls = k_t[:, :1, :, :]
+        k_spatial = k_t[:, 1:, :, :]
+        
+        # Apply RoPE to spatial only
+        # freqs_cos/sin are (1, N_spatial, 1, D)
+        q_spatial = apply_rotary_pos_emb(q_spatial, self.freqs_cos, self.freqs_sin)
+        k_spatial = apply_rotary_pos_emb(k_spatial, self.freqs_cos, self.freqs_sin)
+        
+        # Concat back
+        q_t = torch.cat([q_cls, q_spatial], dim=1)
+        k_t = torch.cat([k_cls, k_spatial], dim=1)
+        
+        q = q_t.transpose(1, 2)
+        k = k_t.transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class PolarRoPEAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., 
+                 img_size=32, patch_size=4):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Precompute Polar RoPE frequencies
+        grid_size = img_size // patch_size
+        self.head_dim = head_dim
+        
+        # 1. Coordinate System Transformation
+        # Center definition
+        c_x = (grid_size - 1) / 2.0
+        c_y = (grid_size - 1) / 2.0
+        
+        # Grid coordinates
+        y_idx, x_idx = torch.meshgrid(torch.arange(grid_size), torch.arange(grid_size), indexing='ij')
+        
+        # Centered coordinates (convert to float for precise calculation)
+        x_prime = x_idx.float() - c_x
+        y_prime = y_idx.float() - c_y
+        
+        # Polar coordinates
+        r = torch.sqrt(x_prime**2 + y_prime**2).flatten() # (N,)
+        theta = torch.atan2(y_prime, x_prime).flatten() # (N,)
+        
+        # 2. Frequency Decomposition
+        # Split head_dim into two halves: 0~D/2 for r, D/2~D for theta
+        half_dim = head_dim // 2
+        
+        # Frequencies for r (using first half of dimensions)
+        # We use half_dim for r, so we generate frequencies for it.
+        # Standard RoPE uses pairs, so we need half_dim to be even.
+        freqs_r_dim = half_dim
+        theta_r = 10000.0 ** (-torch.arange(0, freqs_r_dim, 2).float() / freqs_r_dim)
+        freqs_r = torch.outer(r, theta_r) # (N, freqs_r_dim/2)
+        
+        # Frequencies for theta (using second half of dimensions)
+        freqs_theta_dim = head_dim - half_dim
+        theta_theta = 10000.0 ** (-torch.arange(0, freqs_theta_dim, 2).float() / freqs_theta_dim)
+        freqs_theta = torch.outer(theta, theta_theta) # (N, freqs_theta_dim/2)
+        
+        # Expand to match dimensions for rotation (cos/sin needs to be applied to pairs)
+        # We repeat interleave to get (N, dim)
+        freqs_r_expanded = freqs_r.repeat_interleave(2, dim=1) # (N, freqs_r_dim)
+        freqs_theta_expanded = freqs_theta.repeat_interleave(2, dim=1) # (N, freqs_theta_dim)
+        
+        # Concatenate to get full head_dim frequencies
+        freqs = torch.cat([freqs_r_expanded, freqs_theta_expanded], dim=1) # (N, head_dim)
+        
+        self.register_buffer("freqs_cos", freqs.cos().unsqueeze(0).unsqueeze(2)) # (1, N, 1, D)
+        self.register_buffer("freqs_sin", freqs.sin().unsqueeze(0).unsqueeze(2))
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2] # (B, H, N, D)
+
+        # Apply RoPE to Q and K
+        q_t = q.transpose(1, 2) # (B, N, H, D)
+        k_t = k.transpose(1, 2)
+        
+        # Split CLS and Spatial
+        q_cls = q_t[:, :1, :, :]
+        q_spatial = q_t[:, 1:, :, :]
+        k_cls = k_t[:, :1, :, :]
+        k_spatial = k_t[:, 1:, :, :]
+        
+        # Apply RoPE to spatial only
+        q_spatial = apply_rotary_pos_emb(q_spatial, self.freqs_cos, self.freqs_sin)
+        k_spatial = apply_rotary_pos_emb(k_spatial, self.freqs_cos, self.freqs_sin)
+        
+        # Concat back
+        q_t = torch.cat([q_cls, q_spatial], dim=1)
+        k_t = torch.cat([k_cls, k_spatial], dim=1)
+        
+        q = q_t.transpose(1, 2)
+        k = k_t.transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class ROnlyRoPEAttention(nn.Module):
+    """Ablation: Uses radial distance (r) for the first half of head_dim, identity for the second half.
+    
+    This maintains the same structure as full PolarRoPE (head_dim split into two halves),
+    but only applies RoPE to the r-portion while leaving the theta-portion as identity.
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., 
+                 img_size=32, patch_size=4):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Precompute R-Only RoPE frequencies (ablation: r on first half, identity on second half)
+        grid_size = img_size // patch_size
+        self.head_dim = head_dim
+        
+        # Coordinate System Transformation
+        c_x = (grid_size - 1) / 2.0
+        c_y = (grid_size - 1) / 2.0
+        
+        y_idx, x_idx = torch.meshgrid(torch.arange(grid_size), torch.arange(grid_size), indexing='ij')
+        
+        x_prime = x_idx.float() - c_x
+        y_prime = y_idx.float() - c_y
+        
+        # Compute radial distance
+        r = torch.sqrt(x_prime**2 + y_prime**2).flatten() # (N,)
+        
+        # Split head_dim into two halves (same structure as full polar)
+        half_dim = head_dim // 2
+        
+        # Frequencies for r (first half of dimensions)
+        theta_r = 10000.0 ** (-torch.arange(0, half_dim, 2).float() / half_dim)
+        freqs_r = torch.outer(r, theta_r) # (N, half_dim/2)
+        freqs_r_expanded = freqs_r.repeat_interleave(2, dim=1) # (N, half_dim)
+        
+        # Identity for second half: freqs=0 means cos=1, sin=0 -> identity transform
+        freqs_identity = torch.zeros(r.size(0), half_dim) # (N, half_dim)
+        
+        # Concatenate: [r-based RoPE | identity]
+        freqs = torch.cat([freqs_r_expanded, freqs_identity], dim=1) # (N, head_dim)
+        
+        self.register_buffer("freqs_cos", freqs.cos().unsqueeze(0).unsqueeze(2)) # (1, N, 1, D)
+        self.register_buffer("freqs_sin", freqs.sin().unsqueeze(0).unsqueeze(2))
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2] # (B, H, N, D)
+
+        q_t = q.transpose(1, 2) # (B, N, H, D)
+        k_t = k.transpose(1, 2)
+        
+        # Split CLS and Spatial
+        q_cls = q_t[:, :1, :, :]
+        q_spatial = q_t[:, 1:, :, :]
+        k_cls = k_t[:, :1, :, :]
+        k_spatial = k_t[:, 1:, :, :]
+        
+        # Apply RoPE to spatial only
+        q_spatial = apply_rotary_pos_emb(q_spatial, self.freqs_cos, self.freqs_sin)
+        k_spatial = apply_rotary_pos_emb(k_spatial, self.freqs_cos, self.freqs_sin)
+        
+        # Concat back
+        q_t = torch.cat([q_cls, q_spatial], dim=1)
+        k_t = torch.cat([k_cls, k_spatial], dim=1)
+        
+        q = q_t.transpose(1, 2)
+        k = k_t.transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class ThetaOnlyRoPEAttention(nn.Module):
+    """Ablation: Uses identity for the first half of head_dim, angular position (theta) for the second half.
+    
+    This maintains the same structure as full PolarRoPE (head_dim split into two halves),
+    but only applies RoPE to the theta-portion while leaving the r-portion as identity.
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., 
+                 img_size=32, patch_size=4):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Precompute Theta-Only RoPE frequencies (ablation: identity on first half, theta on second half)
+        grid_size = img_size // patch_size
+        self.head_dim = head_dim
+        
+        # Coordinate System Transformation
+        c_x = (grid_size - 1) / 2.0
+        c_y = (grid_size - 1) / 2.0
+        
+        y_idx, x_idx = torch.meshgrid(torch.arange(grid_size), torch.arange(grid_size), indexing='ij')
+        
+        x_prime = x_idx.float() - c_x
+        y_prime = y_idx.float() - c_y
+        
+        # Compute angular position
+        theta = torch.atan2(y_prime, x_prime).flatten() # (N,)
+        
+        # Split head_dim into two halves (same structure as full polar)
+        half_dim = head_dim // 2
+        
+        # Identity for first half: freqs=0 means cos=1, sin=0 -> identity transform
+        freqs_identity = torch.zeros(theta.size(0), half_dim) # (N, half_dim)
+        
+        # Frequencies for theta (second half of dimensions)
+        theta_freq = 10000.0 ** (-torch.arange(0, half_dim, 2).float() / half_dim)
+        freqs_theta = torch.outer(theta, theta_freq) # (N, half_dim/2)
+        freqs_theta_expanded = freqs_theta.repeat_interleave(2, dim=1) # (N, half_dim)
+        
+        # Concatenate: [identity | theta-based RoPE]
+        freqs = torch.cat([freqs_identity, freqs_theta_expanded], dim=1) # (N, head_dim)
+        
+        self.register_buffer("freqs_cos", freqs.cos().unsqueeze(0).unsqueeze(2)) # (1, N, 1, D)
+        self.register_buffer("freqs_sin", freqs.sin().unsqueeze(0).unsqueeze(2))
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2] # (B, H, N, D)
+
+        q_t = q.transpose(1, 2) # (B, N, H, D)
+        k_t = k.transpose(1, 2)
+        
+        # Split CLS and Spatial
+        q_cls = q_t[:, :1, :, :]
+        q_spatial = q_t[:, 1:, :, :]
+        k_cls = k_t[:, :1, :, :]
+        k_spatial = k_t[:, 1:, :, :]
+        
+        # Apply RoPE to spatial only
+        q_spatial = apply_rotary_pos_emb(q_spatial, self.freqs_cos, self.freqs_sin)
+        k_spatial = apply_rotary_pos_emb(k_spatial, self.freqs_cos, self.freqs_sin)
+        
+        # Concat back
+        q_t = torch.cat([q_cls, q_spatial], dim=1)
+        k_t = torch.cat([k_cls, k_spatial], dim=1)
+        
+        q = q_t.transpose(1, 2)
+        k = k_t.transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+# --- Standard Attention (for non-RoPE) ---
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., 
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, pe_method='sinusoidal', img_size=32, patch_size=4):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        if pe_method == 'rope':
+            self.attn = RoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
+                                      img_size=img_size, patch_size=patch_size)
+        elif pe_method == 'polar_rope':
+            self.attn = PolarRoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
+                                      img_size=img_size, patch_size=patch_size)
+        elif pe_method == 'r_only_rope':
+            self.attn = ROnlyRoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
+                                      img_size=img_size, patch_size=patch_size)
+        elif pe_method == 'theta_only_rope':
+            self.attn = ThetaOnlyRoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
+                                      img_size=img_size, patch_size=patch_size)
+        else:
+            self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class VisionTransformer(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_channels=3, num_classes=10, embed_dim=192, depth=9,
+                 num_heads=12, mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
+                 pe_method='sinusoidal'): # pe_method: 'sinusoidal', 'learnable', 'rope', 'polar_rope'
+        super().__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.pe_method = pe_method
+
+        self.patch_embed = PatchEmbedding(img_size=img_size, patch_size=patch_size, in_channels=in_channels, embed_dim=embed_dim)
+        num_patches = self.patch_embed.n_patches
+
+        # Class token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+        # Positional Encoding
+        if pe_method == 'sinusoidal':
+            self.pos_embed = SinusoidalPE2D(embed_dim, num_patches + 1, img_size, patch_size)
+        elif pe_method == 'learnable':
+            self.pos_embed = LearnablePE(embed_dim, num_patches + 1)
+        elif pe_method in ['rope', 'polar_rope', 'r_only_rope', 'theta_only_rope']:
+            self.pos_embed = nn.Identity() # RoPE is applied in Attention
+        else:
+            raise ValueError(f"Unknown PE method: {pe_method}")
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
+                drop=drop_rate, attn_drop=attn_drop_rate, pe_method=pe_method,
+                img_size=img_size, patch_size=patch_size
+            )
+            for _ in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+        # Init weights
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        if self.pe_method not in ['rope', 'polar_rope', 'r_only_rope', 'theta_only_rope']:
+            x = self.pos_embed(x)
+        
+        x = self.pos_drop(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        x = x[:, 0] # CLS token
+        x = self.head(x)
+        return x
