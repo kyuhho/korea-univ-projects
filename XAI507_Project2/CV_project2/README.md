@@ -1,5 +1,3 @@
-![Image](https://github.com/user-attachments/assets/abd3fd5c-50ce-4571-bacc-31b0f4f890be)
-
 # Analysis and Design of Positional Encoding Methods in Vision Transformers
 
 This project implements a Vision Transformer (ViT) from scratch on CIFAR-10 and compares three positional encoding methods:
@@ -19,7 +17,7 @@ pip install torch torchvision matplotlib numpy scikit-learn
 
 You can run the training script `main.py` with the following arguments:
 
--   `--pe_method`: Choose the positional encoding method (`sinusoidal`, `rope`, `learnable`, or `all`). Default is `all`.
+-   `--pe_method`: Choose the positional encoding method (`sinusoidal`, `rope`, `learnable`, `polar_rope`, or `all`). Default is `all`.
 -   `--epochs`: Number of training epochs. Default is 50.
 -   `--batch_size`: Batch size. Default is 128.
 -   `--lr`: Learning rate. Default is 1e-3.

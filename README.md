@@ -10,7 +10,7 @@ A collection of projects from Korea University coursework.
 
 - **[Project 2](./XAI507_Project2)**
   - **Topic**: Vision Transformers (ViT)
-  - **Description**: Analysis and design of positional encoding methods (Sinusoidal, RoPE, Learnable) within Vision Transformers.
+  - **Description**: Analysis and design of positional encoding methods (Sinusoidal, RoPE, Learnable, **Polar RoPE (Ours)**) within Vision Transformers.
 
 ## XAI625: Reinforcement Learning Application and Practice
 
